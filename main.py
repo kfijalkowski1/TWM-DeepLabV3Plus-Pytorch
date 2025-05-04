@@ -30,7 +30,7 @@ def get_argparser():
                         choices=['voc', 'cityscapes'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for dataloader")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for dataloader")
 
     # Deeplab Options
     available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
@@ -65,6 +65,8 @@ def get_argparser():
     parser.add_argument("--ckpt", default=None, type=str,
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
+    parser.add_argument("--ignore_previous_best_score", action='store_true', default=False, \
+        help="Save the best model based only on the score acvhieved in the current run (ignore pretrained model's score)")
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy',
                         choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
@@ -323,6 +325,7 @@ def main():
             "scheduler_state": scheduler.state_dict(),
             "best_score": best_score,
         }, path)
+        wandb.save(path, policy="live")
         tqdm.write("Model saved as %s" % path)
 
     utils.mkdir('checkpoints')
@@ -341,7 +344,8 @@ def main():
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
             cur_itrs = checkpoint["cur_itrs"]
-            best_score = checkpoint['best_score']
+            if not opts.ignore_previous_best_score:
+                best_score = checkpoint['best_score']
             print("Training state restored from %s" % opts.ckpt)
         print("Model restored from %s" % opts.ckpt)
         del checkpoint  # free memory
