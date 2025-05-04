@@ -69,7 +69,10 @@ def main():
             if len(files)>0:
                 image_files.extend(files)
     elif os.path.isfile(opts.input):
+        assert os.path.isfile(opts.input), "Image %s does not exist" % opts.input
         image_files.append(opts.input)
+    else:
+        raise AssertionError("Input %s does not exist or it is not a file or directory" % opts.input)
 
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
@@ -92,9 +95,6 @@ def main():
         model.to(device)
 
     #denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
-
-    for img_file in image_files:
-        assert os.path.isfile(img_file), "Image %s does not exist" % img_file
 
     if opts.crop_val:
         transform = T.Compose([

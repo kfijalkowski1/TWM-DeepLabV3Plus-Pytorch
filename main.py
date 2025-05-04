@@ -223,7 +223,6 @@ def get_wandb_run(opts):
     assert WANDB_TOKEN, "WANDB_TOKEN environment variable not set. Please set it to your Weights & Biases API key."
     wandb.login(key=WANDB_TOKEN, verify=True)
 
-    # get run name
     if opts.wandb_run_name is None:
         wandb_run_name = "_".join([
             opts.ckpt.split('/')[-1].split('.')[0],
