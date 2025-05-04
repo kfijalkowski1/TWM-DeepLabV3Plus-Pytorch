@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 import random
 
 import matplotlib
@@ -102,6 +103,8 @@ def get_argparser():
     parser.add_argument("--wandb_team", type=str, default=None, help="Weights & Biases team name")
     parser.add_argument("--wandb_project", type=str, default=None, help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases current run name")
+    parser.add_argument("--wandb_restore_ckpt", type=str, default=None, help="Weights & Biases current run name")
+    parser.add_argument("--wandb_restore_run_path", type=str, default=None, help="Weights & Biases current run name")
     return parser
 
 
@@ -217,7 +220,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
     return score, ret_samples
 
 
-def get_wandb_run(opts):
+def get_wandb_run(opts, ckpt):
     assert opts.enable_wandb and opts.wandb_project is not None and opts.wandb_team is not None, \
         "get_wandb_run was called, but not all required arguments were provided."
 
@@ -227,7 +230,7 @@ def get_wandb_run(opts):
 
     if opts.wandb_run_name is None:
         wandb_run_name = "_".join([
-            opts.ckpt.split('/')[-1].split('.')[0],
+            ckpt.split('/')[-1].split('.')[0],
             f"crop-{opts.crop_size}-outstride-{opts.output_stride}",
             f"loss-{opts.loss_type}",
             f"lr-{opts.lr}-{opts.lr_policy}",
@@ -328,15 +331,9 @@ def main():
         wandb.save(path, policy="live")
         tqdm.write("Model saved as %s" % path)
 
-    utils.mkdir('checkpoints')
-    # Restore
-    best_score = 0.0
-    cur_itrs = 0
-    cur_epochs = 0
-    if opts.ckpt is not None:
-        assert os.path.isfile(opts.ckpt), "--ckpt %s does not exist" % opts.ckpt
+    def load_ckpt(path, model, optimizer, scheduler):
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
-        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'), weights_only=False)
+        checkpoint = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
         model = nn.DataParallel(model)
         model.to(device)
@@ -344,11 +341,44 @@ def main():
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
             cur_itrs = checkpoint["cur_itrs"]
-            if not opts.ignore_previous_best_score:
-                best_score = checkpoint['best_score']
-            print("Training state restored from %s" % opts.ckpt)
-        print("Model restored from %s" % opts.ckpt)
-        del checkpoint  # free memory
+            best_score = checkpoint['best_score']
+            print("Training state restored from %s" % path)
+        print("Model restored from %s" % path)
+        return {
+            "model": model,
+            "optimizer": optimizer,
+            "scheduler": scheduler,
+            "cur_itrs": cur_itrs,
+            "best_score": best_score
+        }
+
+    utils.mkdir('checkpoints')
+    # Restore
+    assert not ((opts.ckpt and (opts.wandb_restore_ckpt or opts.wandb_restore_run_path))), "Cannot restore from both checkpoint file and wandb"
+    assert bool(opts.wandb_restore_ckpt) == bool(opts.wandb_restore_run_path), "Must provide either wandb_restore_ckpt and wandb_restore_run_path or neither of them"
+    best_score = 0.0
+    cur_itrs = 0
+    cur_epochs = 0
+    if opts.ckpt is not None:
+        assert os.path.isfile(opts.ckpt), "--ckpt %s does not exist" % opts.ckpt
+        ckpt = opts.ckpt
+    elif opts.wandb_restore_ckpt is not None:
+        wandb_restored = wandb.restore(
+            name=opts.wandb_restore_ckpt,
+            run_path=opts.wandb_restore_run_path,
+            replace=True,
+            root=Path("checkpoints") / opts.wandb_restore_run_path,
+        )
+        ckpt = wandb_restored.name
+        wandb_restored.close()
+    else:
+        ckpt = None
+
+    if ckpt:
+        loaded_state = load_ckpt(ckpt, model, optimizer, scheduler)
+        model, optimizer, scheduler, cur_itrs = loaded_state["model"], loaded_state["optimizer"], \
+            loaded_state["scheduler"], loaded_state["cur_itrs"]
+        best_score = 0 if opts.ignore_previous_best_score else loaded_state["best_score"]
     else:
         print("[!] Retrain")
         model = nn.DataParallel(model)
@@ -369,7 +399,7 @@ def main():
         return
 
     if opts.enable_wandb:
-        wandb_run = get_wandb_run(opts)
+        wandb_run = get_wandb_run(opts, ckpt)
     else:
         wandb_run = None
 
