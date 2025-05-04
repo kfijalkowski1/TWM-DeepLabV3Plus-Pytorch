@@ -1,24 +1,22 @@
-import os
-from tqdm import tqdm
-import network
-import utils
+import argparse
 import os
 import random
-import argparse
-import numpy as np
 
-from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
-from utils import ext_transforms as et
-from metrics import StreamSegMetrics
-
-import torch
-import torch.nn as nn
-from utils.visualizer import Visualizer
-
-from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
+import network
+import numpy as np
+import torch
+import torch.nn as nn
+import utils
+from datasets import Cityscapes, VOCSegmentation
+from metrics import StreamSegMetrics
+from PIL import Image
+from torch.utils import data
+from tqdm import tqdm
+from utils import ext_transforms as et
+from utils.visualizer import Visualizer
+
 import wandb
 
 
@@ -174,10 +172,10 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in enumerate(tqdm(loader)):
+        for i, (images, labels) in enumerate(tqdm(loader, desc="Validating")):
 
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
+            images = images.to(device, dtype=torch.float32)  # noqa: PLW2901
+            labels = labels.to(device, dtype=torch.long)  # noqa: PLW2901
 
             outputs = model(images)
             preds = outputs.detach().max(dim=1)[1].cpu().numpy()
@@ -189,10 +187,10 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     (images[0].detach().cpu().numpy(), targets[0], preds[0]))
 
             if opts.save_val_results:
-                for i in range(len(images)):
-                    image = images[i].detach().cpu().numpy()
-                    target = targets[i]
-                    pred = preds[i]
+                for j in range(len(images)):
+                    image = images[j].detach().cpu().numpy()
+                    target = targets[j]
+                    pred = preds[j]
 
                     image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
                     target = loader.dataset.decode_target(target).astype(np.uint8)
@@ -202,7 +200,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     Image.fromarray(target).save('results/%d_target.png' % img_id)
                     Image.fromarray(pred).save('results/%d_pred.png' % img_id)
 
-                    fig = plt.figure()
+                    _ = plt.figure()
                     plt.imshow(image)
                     plt.axis('off')
                     plt.imshow(pred, alpha=0.7)
@@ -224,10 +222,27 @@ def get_wandb_run(opts):
     WANDB_TOKEN = os.getenv("WANDB_TOKEN")
     assert WANDB_TOKEN, "WANDB_TOKEN environment variable not set. Please set it to your Weights & Biases API key."
     wandb.login(key=WANDB_TOKEN, verify=True)
+
+    # get run name
+    if opts.wandb_run_name is None:
+        wandb_run_name = "_".join([
+            opts.ckpt.split('/')[-1].split('.')[0],
+            f"crop-{opts.crop_size}-outstride-{opts.output_stride}",
+            f"loss-{opts.loss_type}",
+            f"lr-{opts.lr}-{opts.lr_policy}",
+            f"wd-{opts.weight_decay}",
+            f"batch-{opts.batch_size}",
+            f"iters-{opts.total_itrs}",
+        ])
+        if opts.test_only:
+            wandb_run_name += f"test_{wandb_run_name}"
+    else:
+        wandb_run_name = opts.wandb_run_name
+
     run = wandb.init(
         project=opts.wandb_project,
         entity=opts.wandb_team,
-        name=opts.wandb_run_name,
+        name=wandb_run_name,
         config=vars(opts),
     )
     return run
@@ -249,6 +264,8 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Device: %s" % device)
+    # Reduce VRAM usage by reducing fragmentation
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Setup random seed
     torch.manual_seed(opts.random_seed)
@@ -262,9 +279,10 @@ def main():
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
         train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=opts.num_workers,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
+        drop_last=True, pin_memory=True, persistent_workers=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=opts.num_workers)
+        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=opts.num_workers, \
+            pin_memory=True, persistent_workers=True)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -306,7 +324,7 @@ def main():
             "scheduler_state": scheduler.state_dict(),
             "best_score": best_score,
         }, path)
-        print("Model saved as %s" % path)
+        tqdm.write("Model saved as %s" % path)
 
     utils.mkdir('checkpoints')
     # Restore
@@ -333,6 +351,8 @@ def main():
         model = nn.DataParallel(model)
         model.to(device)
 
+    start_itrs = cur_itrs
+
     # ==========   Train Loop   ==========#
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
                                       np.int32) if opts.enable_vis else None  # sample idxs for visualization
@@ -356,7 +376,7 @@ def main():
         # =====  Train  =====
         model.train()
         cur_epochs += 1
-        for (images, labels) in train_loader:
+        for (images, labels) in tqdm(train_loader, desc=f"Training epoch {cur_epochs}"):
             cur_itrs += 1
 
             if wandb_run is not None:
@@ -381,19 +401,19 @@ def main():
 
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
-                print("Epoch %d, Itrs %d/%d, Loss=%f" %
+                tqdm.write("Epoch %d, Itrs %d/%d, Loss=%f" %
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
-            if (cur_itrs % len(train_loader)) % val_interval == 0:
+            if ((cur_itrs - start_itrs) % len(train_loader)) % val_interval == 0:
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
-                print("validation...")
+                tqdm.write("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
-                print(metrics.to_str(val_score))
+                tqdm.write(metrics.to_str(val_score))
 
                 if wandb_run is not None:
                     wandb.log({
@@ -411,9 +431,9 @@ def main():
                     vis.vis_table("[Val] Class IoU", val_score['Class IoU'])
 
                     for k, (img, target, lbl) in enumerate(ret_samples):
-                        img = (denorm(img) * 255).astype(np.uint8)
-                        target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)
-                        lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)
+                        img = (denorm(img) * 255).astype(np.uint8)  # noqa: PLW2901
+                        target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)  # noqa: PLW2901
+                        lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)  # noqa: PLW2901
                         concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
                         vis.vis_image('Sample %d' % k, concat_img)
                 model.train()

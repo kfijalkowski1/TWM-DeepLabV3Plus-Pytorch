@@ -1,24 +1,16 @@
-from torch.utils.data import dataset
-from tqdm import tqdm
-import network
-import utils
-import os
-import random
 import argparse
-import numpy as np
+import os
+from glob import glob
 
-from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes, cityscapes
-from torchvision import transforms as T
-from metrics import StreamSegMetrics
-
+import network
 import torch
 import torch.nn as nn
-
+import utils
+from datasets import Cityscapes, VOCSegmentation
 from PIL import Image
-import matplotlib
-import matplotlib.pyplot as plt
-from glob import glob
+from torchvision import transforms as T
+from tqdm import tqdm
+
 
 def get_argparser():
     parser = argparse.ArgumentParser()
@@ -50,8 +42,6 @@ def get_argparser():
     parser.add_argument("--val_batch_size", type=int, default=4,
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
-
-    
     parser.add_argument("--ckpt", default=None, type=str,
                         help="resume from checkpoint")
     parser.add_argument("--gpu_id", type=str, default='0',
@@ -80,13 +70,13 @@ def main():
                 image_files.extend(files)
     elif os.path.isfile(opts.input):
         image_files.append(opts.input)
-    
+
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
     utils.set_bn_momentum(model.backbone, momentum=0.01)
-    
+
     if opts.ckpt is not None:
         assert os.path.isfile(opts.ckpt), "--ckpt %s does not exist" % opts.ckpt
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
@@ -131,7 +121,7 @@ def main():
             img = Image.open(img_path).convert('RGB')
             img = transform(img).unsqueeze(0) # To tensor of NCHW
             img = img.to(device)
-            
+
             pred = model(img).max(1)[1].cpu().numpy()[0] # HW
             colorized_preds = decode_fn(pred).astype('uint8')
             colorized_preds = Image.fromarray(colorized_preds)
