@@ -120,6 +120,7 @@ def main():
         os.makedirs(opts.save_val_results_to, exist_ok=True)
     with torch.no_grad():
         model = model.eval()
+        print("Image files: %d" % len(image_files))
         for img_path in tqdm(image_files):
             ext = os.path.basename(img_path).split('.')[-1]
             img_name = os.path.basename(img_path)[:-len(ext)-1]

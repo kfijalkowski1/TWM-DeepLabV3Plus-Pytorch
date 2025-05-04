@@ -1,3 +1,4 @@
+import os
 from tqdm import tqdm
 import network
 import utils
@@ -18,6 +19,7 @@ from utils.visualizer import Visualizer
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
+import wandb
 
 
 def get_argparser():
@@ -30,6 +32,7 @@ def get_argparser():
                         choices=['voc', 'cityscapes'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of workers for dataloader")
 
     # Deeplab Options
     available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
@@ -93,6 +96,12 @@ def get_argparser():
                         help='env for visdom')
     parser.add_argument("--vis_num_samples", type=int, default=8,
                         help='number of samples for visualization (default: 8)')
+
+    # Wandb options
+    parser.add_argument("--enable_wandb", action='store_true', default=False, help="Use Weights & Biases for logging")
+    parser.add_argument("--wandb_team", type=str, default=None, help="Weights & Biases team name")
+    parser.add_argument("--wandb_project", type=str, default=None, help="Weights & Biases project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases current run name")
     return parser
 
 
@@ -208,6 +217,22 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
     return score, ret_samples
 
 
+def get_wandb_run(opts):
+    assert opts.enable_wandb and opts.wandb_project is not None and opts.wandb_team is not None, \
+        "get_wandb_run was called, but not all required arguments were provided."
+
+    WANDB_TOKEN = os.getenv("WANDB_TOKEN")
+    assert WANDB_TOKEN, "WANDB_TOKEN environment variable not set. Please set it to your Weights & Biases API key."
+    wandb.login(key=WANDB_TOKEN, verify=True)
+    run = wandb.init(
+        project=opts.wandb_project,
+        entity=opts.wandb_team,
+        name=opts.wandb_run_name,
+        config=vars(opts),
+    )
+    return run
+
+
 def main():
     opts = get_argparser().parse_args()
     if opts.dataset.lower() == 'voc':
@@ -236,10 +261,10 @@ def main():
 
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=opts.num_workers,
         drop_last=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=opts.num_workers)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -288,7 +313,8 @@ def main():
     best_score = 0.0
     cur_itrs = 0
     cur_epochs = 0
-    if opts.ckpt is not None and os.path.isfile(opts.ckpt):
+    if opts.ckpt is not None:
+        assert os.path.isfile(opts.ckpt), "--ckpt %s not exist" % opts.ckpt
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'), weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
@@ -319,6 +345,11 @@ def main():
         print(metrics.to_str(val_score))
         return
 
+    if opts.enable_wandb:
+        wandb_run = get_wandb_run(opts)
+    else:
+        wandb_run = None
+
     interval_loss = 0
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
@@ -327,8 +358,11 @@ def main():
         for (images, labels) in train_loader:
             cur_itrs += 1
 
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
+            if wandb_run is not None:
+                wandb.log({"epoch": cur_epochs}, step=cur_itrs)
+
+            images = images.to(device, dtype=torch.float32)  # noqa: PLW2901
+            labels = labels.to(device, dtype=torch.long)  # noqa: PLW2901
 
             optimizer.zero_grad()
             outputs = model(images)
@@ -340,6 +374,9 @@ def main():
             interval_loss += np_loss
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
+
+            if wandb_run is not None:
+                wandb.log({"train_loss": np_loss}, step=cur_itrs)
 
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
@@ -356,6 +393,12 @@ def main():
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
                 print(metrics.to_str(val_score))
+
+                if wandb_run is not None:
+                    wandb.log({
+                        "val_" + k.replace(" ", "_"): v for k, v in val_score.items()
+                    }, step=cur_itrs)
+
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
                     save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
