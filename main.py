@@ -174,7 +174,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
+        for i, (images, labels) in enumerate(tqdm(loader)):
 
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
@@ -314,7 +314,7 @@ def main():
     cur_itrs = 0
     cur_epochs = 0
     if opts.ckpt is not None:
-        assert os.path.isfile(opts.ckpt), "--ckpt %s not exist" % opts.ckpt
+        assert os.path.isfile(opts.ckpt), "--ckpt %s does not exist" % opts.ckpt
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'), weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
