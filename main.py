@@ -60,7 +60,7 @@ def get_argparser():
                         help='crop validation (default: False)')
     parser.add_argument("--batch_size", type=int, default=16,
                         help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
+    parser.add_argument("--val_batch_size", type=int, default=16,
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
 
@@ -78,8 +78,8 @@ def get_argparser():
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
                         help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=100,
-                        help="epoch interval for eval (default: 100)")
+    parser.add_argument("--val_interval", type=int, default=None,
+                        help="epoch interval for eval (default: validate every epoch)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
 
@@ -351,6 +351,7 @@ def main():
         wandb_run = None
 
     interval_loss = 0
+    val_interval = opts.val_interval if opts.val_interval is not None else len(train_loader)
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
@@ -384,7 +385,7 @@ def main():
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
-            if (cur_itrs) % opts.val_interval == 0:
+            if (cur_itrs % len(train_loader)) % val_interval == 0:
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
                 print("validation...")
