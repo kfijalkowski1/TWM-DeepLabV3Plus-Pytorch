@@ -1,23 +1,24 @@
-from tqdm import tqdm
-import network
-import utils
-import os
-import random
 import argparse
-import numpy as np
+import os
+from pathlib import Path
+import random
 
-from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
-from utils import ext_transforms as et
-from metrics import StreamSegMetrics
-
-import torch
-import torch.nn as nn
-from utils.visualizer import Visualizer
-
-from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
+import network
+import numpy as np
+import torch
+import torch.nn as nn
+import utils
+from datasets import Cityscapes, VOCSegmentation
+from metrics import StreamSegMetrics
+from PIL import Image
+from torch.utils import data
+from tqdm import tqdm
+from utils import ext_transforms as et
+from utils.visualizer import Visualizer
+
+import wandb
 
 
 def get_argparser():
@@ -30,6 +31,7 @@ def get_argparser():
                         choices=['voc', 'cityscapes'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for dataloader")
 
     # Deeplab Options
     available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
@@ -57,13 +59,15 @@ def get_argparser():
                         help='crop validation (default: False)')
     parser.add_argument("--batch_size", type=int, default=16,
                         help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
+    parser.add_argument("--val_batch_size", type=int, default=16,
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
 
     parser.add_argument("--ckpt", default=None, type=str,
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
+    parser.add_argument("--ignore_previous_best_score", action='store_true', default=False, \
+        help="Save the best model based only on the score acvhieved in the current run (ignore pretrained model's score)")
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy',
                         choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
@@ -75,8 +79,8 @@ def get_argparser():
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
                         help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=100,
-                        help="epoch interval for eval (default: 100)")
+    parser.add_argument("--val_interval", type=int, default=None,
+                        help="epoch interval for eval (default: validate every epoch)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
 
@@ -93,6 +97,14 @@ def get_argparser():
                         help='env for visdom')
     parser.add_argument("--vis_num_samples", type=int, default=8,
                         help='number of samples for visualization (default: 8)')
+
+    # Wandb options
+    parser.add_argument("--enable_wandb", action='store_true', default=False, help="Use Weights & Biases for logging")
+    parser.add_argument("--wandb_team", type=str, default=None, help="Weights & Biases team name")
+    parser.add_argument("--wandb_project", type=str, default=None, help="Weights & Biases project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases current run name")
+    parser.add_argument("--wandb_restore_ckpt", type=str, default=None, help="Weights & Biases current run name")
+    parser.add_argument("--wandb_restore_run_path", type=str, default=None, help="Weights & Biases current run name")
     return parser
 
 
@@ -165,10 +177,10 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
+        for i, (images, labels) in enumerate(tqdm(loader, desc="Validating")):
 
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
+            images = images.to(device, dtype=torch.float32)  # noqa: PLW2901
+            labels = labels.to(device, dtype=torch.long)  # noqa: PLW2901
 
             outputs = model(images)
             preds = outputs.detach().max(dim=1)[1].cpu().numpy()
@@ -180,10 +192,10 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     (images[0].detach().cpu().numpy(), targets[0], preds[0]))
 
             if opts.save_val_results:
-                for i in range(len(images)):
-                    image = images[i].detach().cpu().numpy()
-                    target = targets[i]
-                    pred = preds[i]
+                for j in range(len(images)):
+                    image = images[j].detach().cpu().numpy()
+                    target = targets[j]
+                    pred = preds[j]
 
                     image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
                     target = loader.dataset.decode_target(target).astype(np.uint8)
@@ -193,7 +205,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     Image.fromarray(target).save('results/%d_target.png' % img_id)
                     Image.fromarray(pred).save('results/%d_pred.png' % img_id)
 
-                    fig = plt.figure()
+                    _ = plt.figure()
                     plt.imshow(image)
                     plt.axis('off')
                     plt.imshow(pred, alpha=0.7)
@@ -206,6 +218,38 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
 
         score = metrics.get_results()
     return score, ret_samples
+
+
+def get_wandb_run(opts, ckpt):
+    assert opts.enable_wandb and opts.wandb_project is not None and opts.wandb_team is not None, \
+        "get_wandb_run was called, but not all required arguments were provided."
+
+    WANDB_TOKEN = os.getenv("WANDB_TOKEN")
+    assert WANDB_TOKEN, "WANDB_TOKEN environment variable not set. Please set it to your Weights & Biases API key."
+    wandb.login(key=WANDB_TOKEN, verify=True)
+
+    if opts.wandb_run_name is None:
+        wandb_run_name = "_".join([
+            ckpt.split('/')[-1].split('.')[0],
+            f"crop-{opts.crop_size}-outstride-{opts.output_stride}",
+            f"loss-{opts.loss_type}",
+            f"lr-{opts.lr}-{opts.lr_policy}",
+            f"wd-{opts.weight_decay}",
+            f"batch-{opts.batch_size}",
+            f"iters-{opts.total_itrs}",
+        ])
+        if opts.test_only:
+            wandb_run_name += f"test_{wandb_run_name}"
+    else:
+        wandb_run_name = opts.wandb_run_name
+
+    run = wandb.init(
+        project=opts.wandb_project,
+        entity=opts.wandb_team,
+        name=wandb_run_name,
+        config=vars(opts),
+    )
+    return run
 
 
 def main():
@@ -224,6 +268,8 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Device: %s" % device)
+    # Reduce VRAM usage by reducing fragmentation
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Setup random seed
     torch.manual_seed(opts.random_seed)
@@ -236,10 +282,11 @@ def main():
 
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
+        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=opts.num_workers,
+        drop_last=True, pin_memory=True, persistent_workers=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=opts.num_workers, \
+            pin_memory=True, persistent_workers=True)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -281,16 +328,12 @@ def main():
             "scheduler_state": scheduler.state_dict(),
             "best_score": best_score,
         }, path)
-        print("Model saved as %s" % path)
+        wandb.save(path, policy="live")
+        tqdm.write("Model saved as %s" % path)
 
-    utils.mkdir('checkpoints')
-    # Restore
-    best_score = 0.0
-    cur_itrs = 0
-    cur_epochs = 0
-    if opts.ckpt is not None and os.path.isfile(opts.ckpt):
+    def load_ckpt(path, model, optimizer, scheduler):
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
-        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'), weights_only=False)
+        checkpoint = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
         model = nn.DataParallel(model)
         model.to(device)
@@ -299,13 +342,49 @@ def main():
             scheduler.load_state_dict(checkpoint["scheduler_state"])
             cur_itrs = checkpoint["cur_itrs"]
             best_score = checkpoint['best_score']
-            print("Training state restored from %s" % opts.ckpt)
-        print("Model restored from %s" % opts.ckpt)
-        del checkpoint  # free memory
+            print("Training state restored from %s" % path)
+        print("Model restored from %s" % path)
+        return {
+            "model": model,
+            "optimizer": optimizer,
+            "scheduler": scheduler,
+            "cur_itrs": cur_itrs,
+            "best_score": best_score
+        }
+
+    utils.mkdir('checkpoints')
+    # Restore
+    assert not ((opts.ckpt and (opts.wandb_restore_ckpt or opts.wandb_restore_run_path))), "Cannot restore from both checkpoint file and wandb"
+    assert bool(opts.wandb_restore_ckpt) == bool(opts.wandb_restore_run_path), "Must provide either wandb_restore_ckpt and wandb_restore_run_path or neither of them"
+    best_score = 0.0
+    cur_itrs = 0
+    cur_epochs = 0
+    if opts.ckpt is not None:
+        assert os.path.isfile(opts.ckpt), "--ckpt %s does not exist" % opts.ckpt
+        ckpt = opts.ckpt
+    elif opts.wandb_restore_ckpt is not None:
+        wandb_restored = wandb.restore(
+            name=opts.wandb_restore_ckpt,
+            run_path=opts.wandb_restore_run_path,
+            replace=True,
+            root=Path("checkpoints") / opts.wandb_restore_run_path,
+        )
+        ckpt = wandb_restored.name
+        wandb_restored.close()
+    else:
+        ckpt = None
+
+    if ckpt:
+        loaded_state = load_ckpt(ckpt, model, optimizer, scheduler)
+        model, optimizer, scheduler, cur_itrs = loaded_state["model"], loaded_state["optimizer"], \
+            loaded_state["scheduler"], loaded_state["cur_itrs"]
+        best_score = 0 if opts.ignore_previous_best_score else loaded_state["best_score"]
     else:
         print("[!] Retrain")
         model = nn.DataParallel(model)
         model.to(device)
+
+    start_itrs = cur_itrs
 
     # ==========   Train Loop   ==========#
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
@@ -319,16 +398,25 @@ def main():
         print(metrics.to_str(val_score))
         return
 
+    if opts.enable_wandb:
+        wandb_run = get_wandb_run(opts, ckpt)
+    else:
+        wandb_run = None
+
     interval_loss = 0
+    val_interval = opts.val_interval if opts.val_interval is not None else len(train_loader)
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
         cur_epochs += 1
-        for (images, labels) in train_loader:
+        for (images, labels) in tqdm(train_loader, desc=f"Training epoch {cur_epochs}"):
             cur_itrs += 1
 
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
+            if wandb_run is not None:
+                wandb.log({"epoch": cur_epochs}, step=cur_itrs)
+
+            images = images.to(device, dtype=torch.float32)  # noqa: PLW2901
+            labels = labels.to(device, dtype=torch.long)  # noqa: PLW2901
 
             optimizer.zero_grad()
             outputs = model(images)
@@ -341,21 +429,30 @@ def main():
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
 
+            if wandb_run is not None:
+                wandb.log({"train_loss": np_loss}, step=cur_itrs)
+
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
-                print("Epoch %d, Itrs %d/%d, Loss=%f" %
+                tqdm.write("Epoch %d, Itrs %d/%d, Loss=%f" %
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
-            if (cur_itrs) % opts.val_interval == 0:
+            if ((cur_itrs - start_itrs) % len(train_loader)) % val_interval == 0:
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
-                print("validation...")
+                tqdm.write("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
-                print(metrics.to_str(val_score))
+                tqdm.write(metrics.to_str(val_score))
+
+                if wandb_run is not None:
+                    wandb.log({
+                        "val_" + k.replace(" ", "_"): v for k, v in val_score.items()
+                    }, step=cur_itrs)
+
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
                     save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
@@ -367,9 +464,9 @@ def main():
                     vis.vis_table("[Val] Class IoU", val_score['Class IoU'])
 
                     for k, (img, target, lbl) in enumerate(ret_samples):
-                        img = (denorm(img) * 255).astype(np.uint8)
-                        target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)
-                        lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)
+                        img = (denorm(img) * 255).astype(np.uint8)  # noqa: PLW2901
+                        target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)  # noqa: PLW2901
+                        lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)  # noqa: PLW2901
                         concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
                         vis.vis_image('Sample %d' % k, concat_img)
                 model.train()
