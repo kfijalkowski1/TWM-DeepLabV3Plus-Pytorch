@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 import random
+import functools
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -19,6 +20,7 @@ from utils import ext_transforms as et
 from utils.visualizer import Visualizer
 
 import wandb
+import yaml
 
 
 def get_argparser():
@@ -50,6 +52,7 @@ def get_argparser():
                         help="save segmentation results to \"./results\"")
     parser.add_argument("--total_itrs", type=int, default=30e3,
                         help="epoch number (default: 30k)")
+    parser.add_argument("--n_epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
     parser.add_argument("--lr_policy", type=str, default='poly', choices=['poly', 'step'],
@@ -105,6 +108,9 @@ def get_argparser():
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases current run name")
     parser.add_argument("--wandb_restore_ckpt", type=str, default=None, help="Weights & Biases current run name")
     parser.add_argument("--wandb_restore_run_path", type=str, default=None, help="Weights & Biases current run name")
+
+    parser.add_argument("--wandb_sweep_config", type=str, help="Weights & Biases sweep config file path")
+    parser.add_argument("--wandb_sweep_id", type=str, default=None, help="Weights & Biases sweep id. If provided, an existing sweep will be used instead of creating a new one.")
     return parser
 
 
@@ -177,7 +183,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in enumerate(tqdm(loader, desc="Validating")):
+        for i, (images, labels) in enumerate(tqdm(loader, desc="Validating", leave=False)):
 
             images = images.to(device, dtype=torch.float32)  # noqa: PLW2901
             labels = labels.to(device, dtype=torch.long)  # noqa: PLW2901
@@ -215,21 +221,14 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     plt.savefig('results/%d_overlay.png' % img_id, bbox_inches='tight', pad_inches=0)
                     plt.close()
                     img_id += 1
-
         score = metrics.get_results()
     return score, ret_samples
 
 
 def get_wandb_run(opts, ckpt):
-    assert opts.enable_wandb and opts.wandb_project is not None and opts.wandb_team is not None, \
-        "get_wandb_run was called, but not all required arguments were provided."
-
-    WANDB_TOKEN = os.getenv("WANDB_TOKEN")
-    assert WANDB_TOKEN, "WANDB_TOKEN environment variable not set. Please set it to your Weights & Biases API key."
-    wandb.login(key=WANDB_TOKEN, verify=True)
-
     if opts.wandb_run_name is None:
         wandb_run_name = "_".join([
+            ("sweep_" if opts.wandb_sweep_config or opts.wandb_sweep_id else ""),
             ckpt.split('/')[-1].split('.')[0],
             f"crop-{opts.crop_size}-outstride-{opts.output_stride}",
             f"loss-{opts.loss_type}",
@@ -251,17 +250,40 @@ def get_wandb_run(opts, ckpt):
     )
     return run
 
+def _main():
+    parser = get_argparser()
+    opts = parser.parse_args()
 
-def main():
-    opts = get_argparser().parse_args()
     if opts.dataset.lower() == 'voc':
         opts.num_classes = 21
     elif opts.dataset.lower() == 'cityscapes':
         opts.num_classes = 19
 
+    if opts.dataset == 'voc' and not opts.crop_val:
+        opts.val_batch_size = 1
+
+    print("Options:")
+    for k, v in vars(opts).items():
+        print(f"{k}: {v}")
+
+    if opts.enable_wandb:
+        wandb_run = get_wandb_run(opts, opts.ckpt)
+    else:
+        wandb_run = None
+
+    if opts.wandb_sweep_config is not None or opts.wandb_sweep_id is not None:
+        assert (config_lr := wandb.config.get("lr")) is not None, "Sweep config must contain 'lr' parameter"
+        assert (config_weight_decay := wandb.config.get("weight_decay")) is not None, "Sweep config must contain 'weight_decay' parameter"
+        assert (config_loss_type := wandb.config.get("loss_type")) is not None, "Sweep config must contain 'loss_type' parameter"
+        opts.lr = config_lr
+        opts.weight_decay = config_weight_decay
+        opts.loss_type = config_loss_type
+
+    wandb_run.config.update(opts, allow_val_change=True)  # Update wandb config with opts
+
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
-                     env=opts.vis_env) if opts.enable_vis else None
+                    env=opts.vis_env) if opts.enable_vis else None
     if vis is not None:  # display options
         vis.vis_table("Options", vars(opts))
 
@@ -277,9 +299,6 @@ def main():
     random.seed(opts.random_seed)
 
     # Setup dataloader
-    if opts.dataset == 'voc' and not opts.crop_val:
-        opts.val_batch_size = 1
-
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
         train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=opts.num_workers,
@@ -288,7 +307,7 @@ def main():
         val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=opts.num_workers, \
             pin_memory=True, persistent_workers=True)
     print("Dataset: %s, Train set: %d, Val set: %d" %
-          (opts.dataset, len(train_dst), len(val_dst)))
+        (opts.dataset, len(train_dst), len(val_dst)))
 
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
@@ -388,7 +407,7 @@ def main():
 
     # ==========   Train Loop   ==========#
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
-                                      np.int32) if opts.enable_vis else None  # sample idxs for visualization
+                                    np.int32) if opts.enable_vis else None  # sample idxs for visualization
     denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
 
     if opts.test_only:
@@ -397,11 +416,6 @@ def main():
             opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
         print(metrics.to_str(val_score))
         return
-
-    if opts.enable_wandb:
-        wandb_run = get_wandb_run(opts, ckpt)
-    else:
-        wandb_run = None
 
     interval_loss = 0
     val_interval = opts.val_interval if opts.val_interval is not None else len(train_loader)
@@ -413,7 +427,7 @@ def main():
             cur_itrs += 1
 
             if wandb_run is not None:
-                wandb.log({"epoch": cur_epochs}, step=cur_itrs)
+                wandb_run.log({"epoch": cur_epochs}, step=cur_itrs)
 
             images = images.to(device, dtype=torch.float32)  # noqa: PLW2901
             labels = labels.to(device, dtype=torch.long)  # noqa: PLW2901
@@ -430,17 +444,17 @@ def main():
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
 
             if wandb_run is not None:
-                wandb.log({"train_loss": np_loss}, step=cur_itrs)
+                wandb_run.log({"train_loss": np_loss}, step=cur_itrs)
 
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
                 tqdm.write("Epoch %d, Itrs %d/%d, Loss=%f" %
-                      (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
+                    (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
             if ((cur_itrs - start_itrs) % len(train_loader)) % val_interval == 0:
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
-                          (opts.model, opts.dataset, opts.output_stride))
+                        (opts.model, opts.dataset, opts.output_stride))
                 tqdm.write("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
@@ -449,14 +463,14 @@ def main():
                 tqdm.write(metrics.to_str(val_score))
 
                 if wandb_run is not None:
-                    wandb.log({
+                    wandb_run.log({
                         "val_" + k.replace(" ", "_"): v for k, v in val_score.items()
                     }, step=cur_itrs)
 
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
                     save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
-                              (opts.model, opts.dataset, opts.output_stride))
+                            (opts.model, opts.dataset, opts.output_stride))
 
                 if vis is not None:  # visualize validation score and samples
                     vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])
@@ -473,8 +487,52 @@ def main():
             scheduler.step()
 
             if cur_itrs >= opts.total_itrs:
+                if wandb_run is not None:
+                    wandb_run.finish()
                 return
+        if cur_epochs >= opts.n_epochs:
+            if wandb_run is not None:
+                wandb_run.finish()
+            return
 
+
+def main():
+    parser = get_argparser()
+    opts = parser.parse_args()
+
+    assert opts.enable_wandb and opts.wandb_project is not None and opts.wandb_team is not None, \
+        "get_wandb_run was called, but not all required arguments were provided."
+
+    if opts.enable_wandb:
+        WANDB_TOKEN = os.getenv("WANDB_TOKEN")
+        assert WANDB_TOKEN, "WANDB_TOKEN environment variable not set. Please set it to your Weights & Biases API key."
+        wandb.login(key=WANDB_TOKEN, verify=True)
+
+
+    assert opts.wandb_sweep_config is None or opts.wandb_sweep_id is None, \
+        "You cannot provide both wandb_sweep_config and wandb_sweep_id. Please provide only one of them."
+
+    if opts.wandb_sweep_config is not None:
+        assert opts.enable_wandb, "You must enable Weights & Biases to use sweeps."
+        assert opts.wandb_project is not None, "You must specify a wandb project name to use sweeps."
+        assert opts.wandb_team is not None, "You must specify a wandb team name to use sweeps."
+        with open(opts.wandb_sweep_config, "r") as f:
+            sweep_config = yaml.safe_load(f)
+        sweep_id = wandb.sweep(sweep_config, project=opts.wandb_project, entity=opts.wandb_team)
+        print(f"Created sweep with id: {sweep_id}")
+    elif opts.wandb_sweep_id is not None:
+        assert opts.enable_wandb, "You must enable Weights & Biases to use sweeps."
+        assert opts.wandb_project is not None, "You must specify a wandb project name to use sweeps."
+        assert opts.wandb_team is not None, "You must specify a wandb team name to use sweeps."
+        sweep_id = opts.wandb_sweep_id
+    else:
+        sweep_id = None
+
+
+    if sweep_id is not None:
+        wandb.agent(sweep_id, function=_main, project=opts.wandb_project, entity=opts.wandb_team)
+    else:
+        _main()
 
 if __name__ == '__main__':
     main()

@@ -1,0 +1,15 @@
+method: bayes
+metric:
+  name: val_Mean_IoU
+  goal: maximize
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-2
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+  loss_type:
+    values: ["cross_entropy", "focal_loss"]
